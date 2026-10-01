@@ -2,15 +2,25 @@ import {
   characterColors,
   createId,
   createStarterStory,
+  DEFAULT_CHARACTER_ROLE,
+  DEFAULT_SCENE_SUMMARY,
   type StoryCharacter,
   type StoryClue,
   type StoryDocument,
   type StoryScene,
 } from '../models/story';
-import { getStats, getTimelineWarning, orderedScenes, validateName } from '../models/storyRules';
+import { getStats, getTimelineWarning, orderedScenes, resolveFillState, validateName } from '../models/storyRules';
 import type { StoryRepository } from '../repositories/storyRepository';
 
 export type ViewModelStatus = 'loading' | 'ready' | 'editing' | 'error' | 'completed';
+
+/** 等待作者确认的疑似默认文案 */
+export interface PendingReview {
+  kind: 'sceneSummary' | 'characterRole';
+  id: string;
+  label: string;
+  value: string;
+}
 
 export interface StoryViewState {
   status: ViewModelStatus;
@@ -28,7 +38,7 @@ export class StoryViewModel {
   private state: StoryViewState = {
     status: 'loading',
     story: null,
-    stats: { characters: 0, scenes: 0, clues: 0, unresolvedClues: 0, completion: 0 },
+    stats: { characters: 0, scenes: 0, clues: 0, unresolvedClues: 0, suspectFields: 0, completion: 0 },
     notice: '',
     error: '',
     search: '',
@@ -49,8 +59,16 @@ export class StoryViewModel {
 
   initialize(): void {
     try {
-      const story = this.repository.load();
-      this.setState({ status: story.status === 'complete' ? 'completed' : 'ready', story, stats: getStats(story), error: '' });
+      const { story, detected } = this.repository.load();
+      this.setState({
+        status: story.status === 'complete' ? 'completed' : 'ready',
+        story,
+        stats: getStats(story),
+        error: '',
+        notice: detected > 0
+          ? `打开时按内容比对识别出 ${detected} 处与默认提示文案完全相同的内容，请确认它们是否为真实填写。`
+          : '',
+      });
     } catch {
       this.setState({ status: 'error', error: '故事读取失败，请重置为示例项目。' });
     }
@@ -75,14 +93,29 @@ export class StoryViewModel {
       return;
     }
     const story = this.requireStory();
+    const trimmedRole = role.trim();
     const character: StoryCharacter = {
       id: createId('character'),
       name: cleanName,
-      role: role.trim() || '待定义角色',
+      // 逐字等于默认提示文案的输入按未填写处理，避免新数据再次混入默认文案
+      role: trimmedRole === DEFAULT_CHARACTER_ROLE ? '' : trimmedRole,
+      roleState: trimmedRole === '' || trimmedRole === DEFAULT_CHARACTER_ROLE ? 'placeholder' : 'filled',
       color: characterColors[story.characters.length % characterColors.length],
     };
     this.updateStory((current) => ({ ...current, characters: [...current.characters, character] }));
     this.setState({ notice: `已加入人物「${character.name}」` });
+  }
+
+  /** 编辑人物身份：填写状态随内容实时推导，完成度立即更新 */
+  updateCharacterRole(characterId: string, role: string): void {
+    this.updateStory((story) => ({
+      ...story,
+      characters: story.characters.map((character) => (
+        character.id === characterId
+          ? { ...character, role, roleState: resolveFillState(role, DEFAULT_CHARACTER_ROLE, character.roleState) }
+          : character
+      )),
+    }), false);
   }
 
   addScene(title: string, summary: string): void {
@@ -92,11 +125,14 @@ export class StoryViewModel {
       return;
     }
     const story = this.requireStory();
+    const trimmedSummary = summary.trim();
     const scene: StoryScene = {
       id: createId('scene'),
       title: cleanTitle,
       order: story.scenes.length + 1,
-      summary: summary.trim() || '还没有写下这一幕发生了什么。',
+      // 默认提示文案只作为输入框 placeholder，不写入摘要内容本身
+      summary: trimmedSummary === DEFAULT_SCENE_SUMMARY ? '' : trimmedSummary,
+      summaryState: trimmedSummary === '' || trimmedSummary === DEFAULT_SCENE_SUMMARY ? 'placeholder' : 'filled',
       conflict: '',
       characterIds: [],
       clueIds: [],
@@ -108,8 +144,67 @@ export class StoryViewModel {
   updateScene(sceneId: string, patch: Partial<Pick<StoryScene, 'title' | 'summary' | 'conflict'>>): void {
     this.updateStory((story) => ({
       ...story,
-      scenes: story.scenes.map((scene) => (scene.id === sceneId ? { ...scene, ...patch } : scene)),
+      scenes: story.scenes.map((scene) => {
+        if (scene.id !== sceneId) return scene;
+        // 摘要改动时实时推导填写状态：补写真实内容立刻算已完成，删空立刻退回未填写
+        const next = { ...scene, ...patch };
+        if (patch.summary !== undefined) {
+          next.summaryState = resolveFillState(patch.summary, DEFAULT_SCENE_SUMMARY, scene.summaryState);
+        }
+        return next;
+      }),
     }), false);
+  }
+
+  /** 作者确认疑似默认文案：确认真实填写，或确认仍然未填写（清空内容） */
+  reviewSceneSummary(sceneId: string, isFilled: boolean): void {
+    this.updateStory((story) => ({
+      ...story,
+      scenes: story.scenes.map((scene) => (
+        scene.id === sceneId
+          ? {
+              ...scene,
+              summaryState: isFilled ? 'filled' : 'placeholder',
+              summary: isFilled ? scene.summary : '',
+            }
+          : scene
+      )),
+    }), false);
+    this.setState({ notice: isFilled ? '已确认为真实填写' : '已标记为未填写，等待补写' });
+  }
+
+  reviewCharacterRole(characterId: string, isFilled: boolean): void {
+    this.updateStory((story) => ({
+      ...story,
+      characters: story.characters.map((character) => (
+        character.id === characterId
+          ? {
+              ...character,
+              roleState: isFilled ? 'filled' : 'placeholder',
+              role: isFilled ? character.role : '',
+            }
+          : character
+      )),
+    }), false);
+    this.setState({ notice: isFilled ? '已确认为真实填写' : '已标记为未填写，等待补写' });
+  }
+
+  /** 一键确认全部疑似项；确认真实填写保留原文，确认未填写则清空 */
+  resolveAllSuspects(isFilled: boolean): void {
+    this.updateStory((story) => ({
+      ...story,
+      scenes: story.scenes.map((scene) => (
+        scene.summaryState === 'suspect'
+          ? { ...scene, summaryState: isFilled ? 'filled' : 'placeholder', summary: isFilled ? scene.summary : '' }
+          : scene
+      )),
+      characters: story.characters.map((character) => (
+        character.roleState === 'suspect'
+          ? { ...character, roleState: isFilled ? 'filled' : 'placeholder', role: isFilled ? character.role : '' }
+          : character
+      )),
+    }), false);
+    this.setState({ notice: isFilled ? '全部疑似内容已确认为真实填写' : '全部疑似内容已标记为未填写' });
   }
 
   toggleCharacter(sceneId: string, characterId: string): void {
@@ -178,6 +273,19 @@ export class StoryViewModel {
   get selectedScene(): StoryScene | null {
     const story = this.state.story;
     return story?.scenes.find((scene) => scene.id === story.selectedSceneId) ?? null;
+  }
+
+  /** 打开时识别出的疑似默认文案，供作者逐条确认或纠正 */
+  get pendingReviews(): PendingReview[] {
+    const story = this.state.story;
+    if (!story) return [];
+    const sceneReviews = orderedScenes(story)
+      .filter((scene) => scene.summaryState === 'suspect')
+      .map((scene): PendingReview => ({ kind: 'sceneSummary', id: scene.id, label: `场景「${scene.title}」摘要`, value: scene.summary }));
+    const characterReviews = story.characters
+      .filter((character) => character.roleState === 'suspect')
+      .map((character): PendingReview => ({ kind: 'characterRole', id: character.id, label: `人物「${character.name}」身份`, value: character.role }));
+    return [...sceneReviews, ...characterReviews];
   }
 
   get timelineWarning(): string | null {
