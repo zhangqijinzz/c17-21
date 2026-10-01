@@ -2,15 +2,25 @@ import {
   characterColors,
   createId,
   createStarterStory,
+  DEFAULT_CHARACTER_ROLE,
+  DEFAULT_SCENE_SUMMARY,
   type StoryCharacter,
   type StoryClue,
   type StoryDocument,
   type StoryScene,
 } from '../models/story';
-import { getStats, getTimelineWarning, orderedScenes, validateName } from '../models/storyRules';
+import { getStats, getTimelineWarning, isDefaultRole, isDefaultSummary, orderedScenes, validateName } from '../models/storyRules';
 import type { StoryRepository } from '../repositories/storyRepository';
 
 export type ViewModelStatus = 'loading' | 'ready' | 'editing' | 'error' | 'completed';
+
+export interface PendingReviewItem {
+  kind: 'scene' | 'character';
+  id: string;
+  title: string;
+  field: string;
+  content: string;
+}
 
 export interface StoryViewState {
   status: ViewModelStatus;
@@ -24,11 +34,22 @@ export interface StoryViewState {
 
 type Listener = () => void;
 
+const EMPTY_STATS: ReturnType<typeof getStats> = {
+  characters: 0,
+  scenes: 0,
+  clues: 0,
+  unresolvedClues: 0,
+  placeholderScenes: 0,
+  placeholderCharacters: 0,
+  pendingReview: 0,
+  completion: 0,
+};
+
 export class StoryViewModel {
   private state: StoryViewState = {
     status: 'loading',
     story: null,
-    stats: { characters: 0, scenes: 0, clues: 0, unresolvedClues: 0, completion: 0 },
+    stats: EMPTY_STATS,
     notice: '',
     error: '',
     search: '',
@@ -75,10 +96,12 @@ export class StoryViewModel {
       return;
     }
     const story = this.requireStory();
+    const cleanRole = role.trim();
     const character: StoryCharacter = {
       id: createId('character'),
       name: cleanName,
-      role: role.trim() || '待定义角色',
+      role: cleanRole || DEFAULT_CHARACTER_ROLE,
+      roleState: isDefaultRole(cleanRole) ? 'placeholder' : 'filled',
       color: characterColors[story.characters.length % characterColors.length],
     };
     this.updateStory((current) => ({ ...current, characters: [...current.characters, character] }));
@@ -92,11 +115,13 @@ export class StoryViewModel {
       return;
     }
     const story = this.requireStory();
+    const cleanSummary = summary.trim();
     const scene: StoryScene = {
       id: createId('scene'),
       title: cleanTitle,
       order: story.scenes.length + 1,
-      summary: summary.trim() || '还没有写下这一幕发生了什么。',
+      summary: cleanSummary || DEFAULT_SCENE_SUMMARY,
+      summaryState: isDefaultSummary(cleanSummary) ? 'placeholder' : 'filled',
       conflict: '',
       characterIds: [],
       clueIds: [],
@@ -108,8 +133,39 @@ export class StoryViewModel {
   updateScene(sceneId: string, patch: Partial<Pick<StoryScene, 'title' | 'summary' | 'conflict'>>): void {
     this.updateStory((story) => ({
       ...story,
-      scenes: story.scenes.map((scene) => (scene.id === sceneId ? { ...scene, ...patch } : scene)),
+      scenes: story.scenes.map((scene) => {
+        if (scene.id !== sceneId) return scene;
+        const next = { ...scene, ...patch };
+        // 摘要一旦被编辑就按内容重新判定：写成真实内容立即脱离"未填写"，清空则回到未填写。
+        if (patch.summary !== undefined) {
+          next.summaryState = isDefaultSummary(patch.summary) ? 'placeholder' : 'filled';
+        }
+        return next;
+      }),
     }), false);
+  }
+
+  /** 确认待核对项"仍未填写"，计入未填写。 */
+  confirmPendingUnwritten(kind: PendingReviewItem['kind'], id: string): void {
+    this.resolvePending(kind, id, 'placeholder');
+    this.setState({ notice: '已确认仍未填写，完成度已更新' });
+  }
+
+  /** 纠正待核对项：内容虽与默认文案相同，但确实是作者写下的。 */
+  markPendingAsWritten(kind: PendingReviewItem['kind'], id: string): void {
+    this.resolvePending(kind, id, 'filled');
+    this.setState({ notice: '已标记为真实内容' });
+  }
+
+  confirmAllPendingUnwritten(): void {
+    const count = this.state.stats.pendingReview;
+    if (count === 0) return;
+    this.updateStory((story) => ({
+      ...story,
+      scenes: story.scenes.map((scene) => (scene.summaryState === 'pending' ? { ...scene, summaryState: 'placeholder' } : scene)),
+      characters: story.characters.map((character) => (character.roleState === 'pending' ? { ...character, roleState: 'placeholder' } : character)),
+    }));
+    this.setState({ notice: `已确认 ${count} 处内容仍未填写` });
   }
 
   toggleCharacter(sceneId: string, characterId: string): void {
@@ -180,6 +236,20 @@ export class StoryViewModel {
     return story?.scenes.find((scene) => scene.id === story.selectedSceneId) ?? null;
   }
 
+  /** 打开旧项目时按内容比对出的疑似默认文案，等待作者逐条确认或纠正。 */
+  get pendingReviewItems(): PendingReviewItem[] {
+    const story = this.state.story;
+    if (!story) return [];
+    return [
+      ...orderedScenes(story)
+        .filter((scene) => scene.summaryState === 'pending')
+        .map((scene) => ({ kind: 'scene' as const, id: scene.id, title: scene.title, field: '场景摘要', content: scene.summary })),
+      ...story.characters
+        .filter((character) => character.roleState === 'pending')
+        .map((character) => ({ kind: 'character' as const, id: character.id, title: character.name, field: '人物身份', content: character.role })),
+    ];
+  }
+
   get timelineWarning(): string | null {
     const story = this.state.story;
     return story ? getTimelineWarning(story) : null;
@@ -188,6 +258,24 @@ export class StoryViewModel {
   private requireStory(): StoryDocument {
     if (!this.state.story) throw new Error('故事尚未初始化');
     return this.state.story;
+  }
+
+  private resolvePending(kind: PendingReviewItem['kind'], id: string, resolution: 'filled' | 'placeholder'): void {
+    this.updateStory((story) =>
+      kind === 'scene'
+        ? {
+            ...story,
+            scenes: story.scenes.map((scene) =>
+              scene.id === id && scene.summaryState === 'pending' ? { ...scene, summaryState: resolution } : scene,
+            ),
+          }
+        : {
+            ...story,
+            characters: story.characters.map((character) =>
+              character.id === id && character.roleState === 'pending' ? { ...character, roleState: resolution } : character,
+            ),
+          },
+    );
   }
 
   private updateStory(updater: (story: StoryDocument) => StoryDocument, showEditing = true): void {
